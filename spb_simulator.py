@@ -8,19 +8,17 @@ payload/hardware additions mass, fabric density, thermal/radiation data.
 
 Envelope:   V_max = pi D^3 / 6,   A = pi D^2,   m_env = A * fabric_density
 
-Helium rule (sidebar, section 2)
---------------------------------
-A) "Fill V_max at target"  (original, experiment-validated definition - default)
-       The target is the altitude where the launch helium exactly fills the
-       envelope (zero superpressure, helium at ambient temperature):
-           m_He = P(z_t) * V_max * M_He / (R * T(z_t))
-       The balloon keeps some free lift there and continues upward at constant
-       volume to its real float altitude z_float, where
-           rho_air(z_float) * V_max = m_env + m_payload + m_He
-       and it floats with superpressure.
-B) "Float exactly at target"
-           m_He = rho_air(z_t) * V_max - m_env - m_payload
-       (extra helium acts as ballast and becomes superpressure).
+Helium (original, experiment-validated definition)
+--------------------------------------------------
+Base helium = the amount that exactly fills the envelope at the target altitude
+(zero superpressure, helium at ambient temperature):
+    m_He,base = P(z_t) * V_max * M_He / (R * T(z_t))
+Launch helium = base + extra-lift margin (all helium is loaded on the ground):
+    m_He = m_He,base * (1 + margin)
+The balloon rises slack, becomes taut at z_full (= z_t for zero margin, lower
+with margin), then rises at constant volume to its real float altitude
+    rho_air(z_float) * V_max = m_env + m_payload + m_He
+where it floats with superpressure.
 
 In both cases m_He is constant during flight (compressible ideal gas):
     V_He(z) = m_He R T(z) / (P(z) M_He),  launch volume V_0 = V_He(0) < V_max.
@@ -54,9 +52,6 @@ K_HE = M_HE / M_AIR       # helium / air molar-mass ratio (~0.138)
 SIGMA = 5.670374419e-8    # Stefan-Boltzmann constant [W/(m^2 K^4)]
 CV_HE = 3116.0            # helium Cv [J/(kg K)]
 SOLAR_C = 1361.0          # solar constant [W/m^2]
-
-RULE_FILL = "Fill V_max at target (original model)"
-RULE_FLOAT = "Float exactly at target"
 
 COLORS = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692"]
 PASS, WARN, FAIL = "✅ Pass", "⚠️ Warning", "❌ Fail"
@@ -137,12 +132,15 @@ class Envelope:
         return self.m_env + self.payload
 
 
-def helium_for_rule(env: Envelope, z_t, rule):
-    """Launch helium mass for the selected rule."""
-    T, P, rho = atmosphere(z_t)
-    if rule == RULE_FILL:
-        return P * env.v_max * M_HE / (R_U * T)     # fills V_max exactly at z_t
-    return rho * env.v_max - env.m_dry              # floats exactly at z_t
+def base_helium(env: Envelope, z_t):
+    """Helium that exactly fills V_max at the target altitude (original definition)."""
+    T, P, _ = atmosphere(z_t)
+    return P * env.v_max * M_HE / (R_U * T)
+
+
+def launch_helium(env: Envelope, z_t, margin_pct):
+    """Ground-loaded helium = base * (1 + extra-lift margin)."""
+    return base_helium(env, z_t) * (1.0 + margin_pct / 100.0)
 
 
 def float_altitude(env: Envelope, m_he):
@@ -157,12 +155,11 @@ def float_superpressure(env: Envelope, m_he, z):
     return m_he * R_U * T / (env.v_max * M_HE) - P
 
 
-def size_helium(env: Envelope, z_t, rule):
-    """Helium, mass budget and compressible-gas consequences for the chosen rule."""
+def size_helium(env: Envelope, z_t, margin_pct):
+    """Base/launch helium, mass budget and compressible-gas consequences."""
     T_t, P_t, rho_t = atmosphere(z_t)
-    m_fill = P_t * env.v_max * M_HE / (R_U * T_t)   # helium that fills V_max at z_t
-    m_exact = rho_t * env.v_max - env.m_dry         # helium that floats exactly at z_t
-    m_he = m_fill if rule == RULE_FILL else m_exact
+    m_fill = base_helium(env, z_t)                  # helium that fills V_max at z_t
+    m_he = launch_helium(env, z_t, margin_pct)      # loaded on the ground
     mp = max(m_he, 0.0)
     m_total = env.m_dry + mp
     gross = mp / K_HE                               # buoyancy [kg] while slack (constant)
@@ -172,7 +169,7 @@ def size_helium(env: Envelope, z_t, rule):
     z_float = float_altitude(env, mp) if mp > 0 else np.nan
     dp_float = float_superpressure(env, mp, z_float) if np.isfinite(z_float) else np.nan
     z_max = root_altitude(lambda z: atmosphere(z)[2] * env.v_max * (1.0 - K_HE) - env.m_dry)
-    return dict(T=T_t, P=P_t, rho=rho_t, m_he=m_he, m_fill=m_fill, m_exact=m_exact,
+    return dict(T=T_t, P=P_t, rho=rho_t, m_he=m_he, m_fill=m_fill,
                 m_min=K_HE / (1.0 - K_HE) * env.m_dry, m_total=m_total,
                 V0=he_volume(mp, 0.0), z_full=z_full, z_float=z_float, dp_float=dp_float,
                 z_max=z_max, free_lift_kg=gross - m_total,
@@ -400,11 +397,11 @@ def sidebar():
     sb.subheader("2 · Mission")
     z_t = sb.number_input("Target altitude [km]", 1.0, 45.0, 14.0, 0.1) * 1000.0
     payload = sb.number_input("Payload / hardware additions [kg]", 0.0, 10000.0, 10.5, 0.1)
-    rule = sb.radio("Helium rule", [RULE_FILL, RULE_FLOAT], index=0,
-                    help="Original model: the launch helium exactly fills V_max at the target; "
-                         "the balloon then floats slightly higher with superpressure.\n\n"
-                         "Float exactly at target: extra helium is added so the balloon stops "
-                         "at the target (extra helium becomes superpressure).")
+    margin = sb.number_input("Extra helium - lift margin [%]", 0.0, 200.0, 0.0, 1.0,
+                             help="0 % = helium that exactly fills V_max at the target "
+                                  "(original model). Extra % is added on the ground: more free "
+                                  "lift and faster ascent, the envelope fills lower, the balloon "
+                                  "floats lower with higher superpressure.")
 
     sb.subheader("3 · Structural & flight limits")
     n_allow = sb.number_input("Film allowable line load [N/m]", 100.0, 500000.0, 15000.0, 100.0,
@@ -440,7 +437,7 @@ def sidebar():
     tau = sb.slider("Atmospheric transmissivity τ", 0.1, 1.0, 0.95, 0.01)
     t_sky = sb.number_input("Sky temperature [K]", 3.0, 300.0, 216.65, 1.0)
 
-    return (Envelope(D, gsm, payload), z_t, rule,
+    return (Envelope(D, gsm, payload), z_t, margin,
             dict(n_allow=n_allow, sf=sf, fl_min=fl_min, v_lo=v_lo, v_hi=v_hi),
             dict(he=he_var, vol=vol_var), dict(cd=cd, c_add=c_add, t=t_asc),
             Thermal(lat, dec, alpha, eps, albedo, tau, t_sky, h_conv, h_int, cp_film, int(spin)))
@@ -462,12 +459,12 @@ def show_grid(figs):
 def main():
     st.set_page_config(page_title="SPB Simulator", page_icon="🎈", layout="wide",
                        initial_sidebar_state="expanded")
-    env, z_t, rule, lim, var, asc, th = sidebar()
+    env, z_t, margin, lim, var, asc, th = sidebar()
     st.title("Super Pressure Balloon Simulator")
-    st.caption(f"Helium rule: **{rule}**  •  D → V_max, m_env  •  compressible helium: "
-               "slack at launch → taut at z_full → float with superpressure")
+    st.caption("D → V_max, m_env  •  helium = fill V_max at target × (1 + lift margin), all loaded "
+               "on the ground  •  slack at launch → taut at z_full → float with superpressure")
 
-    sz = size_helium(env, z_t, rule)
+    sz = size_helium(env, z_t, margin)
     m_he = sz["m_he"]
 
     # ------------------------------------------------------------ 1. sizing
@@ -477,7 +474,8 @@ def main():
     c[1].metric("Envelope mass", f"{env.m_env:,.3f} kg")
     c[2].metric("Payload / additions", f"{env.payload:,.3f} kg")
     c[3].metric("Helium to fill at ground", f"{m_he:,.3f} kg",
-                f"{sz['V0']:,.2f} m³ at ground", delta_color="off")
+                f"base {sz['m_fill']:,.3f} kg + {margin:g}% · {sz['V0']:,.2f} m³",
+                delta_color="off")
     c[4].metric("Total system mass", f"{sz['m_total']:,.3f} kg")
     c[5].metric("Launch free lift", f"{sz['free_lift_pct']:,.1f} %",
                 f"{sz['free_lift_kg'] * G:,.1f} N", delta_color="off")
@@ -493,25 +491,6 @@ def main():
     c[3].metric("Max altitude for this D + mass", f"{sz['z_max'] / 1000:,.2f} km"
                 if np.isfinite(sz["z_max"]) else "—", "minimum helium, zero ΔP",
                 delta_color="off")
-
-    with st.expander("Compare the two helium rules for this D and mass", expanded=False):
-        cmp = []
-        for name in (RULE_FILL, RULE_FLOAT):
-            s2 = size_helium(env, z_t, name)
-            cmp.append({"Rule": name, "Helium [kg]": s2["m_he"],
-                        "Ground volume [m³]": s2["V0"], "Free lift [%]": s2["free_lift_pct"],
-                        "Float [km]": s2["z_float"] / 1000.0, "ΔP at float [Pa]": s2["dp_float"]})
-        st.dataframe(pd.DataFrame(cmp).style.format(
-            {c_: "{:,.2f}" for c_ in cmp[0] if c_ != "Rule"}, na_rep="—"),
-            hide_index=True, width="stretch")
-        st.caption("The original model defines the target as the altitude where the envelope "
-                   "becomes full; the balloon then rises a little further to its real float.")
-
-    if rule == RULE_FLOAT and m_he > 1.3 * sz["m_fill"]:
-        st.warning(f"This envelope with this mass would naturally float up to "
-                   f"{sz['z_max']/1000:.2f} km. To stop it at {z_t/1000:.2f} km the extra helium "
-                   f"acts as ballast: {m_he:.3f} kg is {m_he / sz['m_fill']:.1f}× the "
-                   f"{sz['m_fill']:.3f} kg that fills V_max, and the excess becomes superpressure.")
 
     zs = np.linspace(0.0, max(z_t * 1.25, 5000.0), 300)
     Vfree = np.array([he_volume(max(m_he, 0.0), z) for z in zs])
@@ -574,8 +553,68 @@ def main():
     st.dataframe(pd.DataFrame(checks, columns=["Check", "Value", "Limit", "Status", "Comment"]),
                  hide_index=True, width="stretch")
 
-    # ------------------------------------------------------- 3. summary
-    st.header("3 · Simulation summary")
+    # ------------------------------------------------------- 3. lift margin study
+    st.header("3 · Extra helium (lift margin) study")
+    st.caption("All helium is loaded on the ground. Day/night ΔP estimated from the baseline "
+               "helium-to-ambient temperature ratios.")
+    r_min, r_max = T_min / T_amb_f, T_max / T_amb_f
+    margins = sorted(set([0, 5, 10, 15, 20, 30, 50, round(margin, 1)]))
+    rows = []
+    for mg in margins:
+        s2 = size_helium(env, z_t, mg)
+        row = {"Margin [%]": mg, "Helium [kg]": s2["m_he"], "Ground volume [m³]": s2["V0"],
+               "Free lift [%]": s2["free_lift_pct"], "Taut at [km]": s2["z_full"] / 1000,
+               "Float [km]": s2["z_float"] / 1000, "Float − target [km]":
+               (s2["z_float"] - z_t) / 1000, "ΔP float isoth. [Pa]": s2["dp_float"]}
+        if s2["free_lift_pct"] > 0 and np.isfinite(s2["z_float"]):
+            Tf, Pf, _ = atmosphere(s2["z_float"])
+            p_iso = s2["m_he"] * R_U * Tf / (env.v_max * M_HE)
+            a2 = run_ascent(s2["m_total"], s2["m_he"], env.v_max, asc["cd"], asc["c_add"],
+                            asc["t"] * 3600.0)
+            sel = (a2["z"] > 100) & (a2["z"] < 0.95 * s2["z_float"]) & (a2["v"] > 0.1)
+            reach = np.where(a2["z"] >= 0.98 * s2["z_float"])[0]
+            row.update({"Mean ascent [m/s]": a2["v"][sel].mean() if sel.any() else np.nan,
+                        "Time to float [min]": a2["t"][reach[0]] / 60 if len(reach) else np.nan,
+                        "ΔP night ≈ [Pa]": p_iso * r_min - Pf, "ΔP day ≈ [Pa]": p_iso * r_max - Pf,
+                        "N day ≈ [N/m]": max(p_iso * r_max - Pf, 0) * env.radius / 2})
+        rows.append(row)
+    mdf = pd.DataFrame(rows).set_index("Margin [%]")
+    st.dataframe(mdf.style.format("{:,.2f}", na_rep="—")
+                 .apply(lambda r: ["background-color: rgba(99,110,250,0.15)"
+                                   if r.name == round(margin, 1) else "" for _ in r], axis=1),
+                 width="stretch")
+
+    mg_axis = np.linspace(0.0, max(60.0, margin * 1.5), 61)
+    ms = []
+    for mg in mg_axis:
+        s2 = size_helium(env, z_t, mg)
+        if s2["free_lift_pct"] > 0 and np.isfinite(s2["z_float"]):
+            Tf, Pf, _ = atmosphere(s2["z_float"])
+            p_iso = s2["m_he"] * R_U * Tf / (env.v_max * M_HE)
+            ms.append((s2["z_float"] / 1000, s2["free_lift_pct"], p_iso * r_min - Pf,
+                       p_iso * r_max - Pf))
+        else:
+            ms.append((np.nan,) * 4)
+    ms = np.array(ms)
+    fm1 = fig("Float altitude and free lift vs lift margin", "Lift margin [%]",
+              "Float altitude [km]", "x unified")
+    fm1.add_trace(go.Scatter(x=mg_axis, y=ms[:, 0], name="Float [km]", line=dict(color=COLORS[0])))
+    fm1.add_trace(go.Scatter(x=mg_axis, y=ms[:, 1], name="Free lift [%]", yaxis="y2",
+                             line=dict(color=COLORS[4], dash="dot")))
+    fm1.update_layout(yaxis2=dict(title="Free lift [%]", overlaying="y", side="right"))
+    fm1.add_hline(y=z_t / 1000, line_dash="dash", line_color="gray", annotation_text="target")
+    fm1.add_vline(x=margin, line_dash="dash", line_color="black")
+    fm2 = fig("Estimated day / night ΔP vs lift margin", "Lift margin [%]", "ΔP [Pa]", "x unified")
+    fm2.add_trace(go.Scatter(x=mg_axis, y=ms[:, 3], name="Day max", line=dict(color=COLORS[1])))
+    fm2.add_trace(go.Scatter(x=mg_axis, y=ms[:, 2], name="Night min", line=dict(color=COLORS[0])))
+    fm2.add_hline(y=0, line_dash="dot", line_color="gray", annotation_text="slack")
+    fm2.add_hline(y=2.0 * n_lim / env.radius, line_dash="dash", line_color=COLORS[1],
+                  annotation_text="burst / SF")
+    fm2.add_vline(x=margin, line_dash="dash", line_color="black")
+    show_grid([fm1, fm2])
+
+    # ------------------------------------------------------- 4. summary
+    st.header("4 · Simulation summary")
     df = pd.DataFrame([summary_row(r, z_t) for r in results]).set_index("Case")
     st.dataframe(df.style.format("{:,.2f}", na_rep="—"), width="stretch")
     st.download_button("Download summary (CSV)", df.to_csv().encode(), "spb_summary.csv",
@@ -585,7 +624,7 @@ def main():
             st.warning(f"{r['label']}: {r['msg']}")
 
     # ------------------------------------------------------- 4. ascent
-    st.header("4 · Ascent")
+    st.header("5 · Ascent")
     f_z = fig("Altitude vs time", "Time [min]", "Altitude [km]")
     f_v = fig("Velocity vs time", "Time [min]", "Velocity [m/s]")
     f_a = fig("Acceleration vs time", "Time [min]", "Acceleration [m/s²]")
@@ -607,7 +646,7 @@ def main():
     show_grid([f_z, f_v, f_a, f_V])
 
     # ------------------------------------------------------- 5. thermal
-    st.header("5 · 24-hour thermal / superpressure cycle at float")
+    st.header("6 · 24-hour thermal / superpressure cycle at float")
     st.caption("t = 0 is local midnight, at each case's real float altitude. Volume = V_max; "
                "ΔP < 0 means the envelope is slack.")
     f_T = fig("Helium temperature", "Hour of day", "T_He [K]")
@@ -633,8 +672,8 @@ def main():
     show_grid([f_T, f_Tf, f_dp, f_N])
 
     # ------------------------------------------------------- 6. design space
-    st.header("6 · Design space")
-    st.caption("Helium from the selected rule at every point. Day/night ΔP are estimated from the "
+    st.header("7 · Design space")
+    st.caption("Helium = fill at target × (1 + lift margin) at every point. Day/night ΔP are estimated from the "
                "baseline helium-to-ambient temperature ratios.")
     r_min, r_max = T_min / T_amb_f, T_max / T_amb_f
     burst_dp = 2.0 * n_lim / env.radius
@@ -642,7 +681,7 @@ def main():
     def sweep(envs):
         out = []
         for ex in envs:
-            mh = helium_for_rule(ex, z_t, rule)
+            mh = launch_helium(ex, z_t, margin)
             zf = float_altitude(ex, mh) if mh > 0 and mh / K_HE > ex.m_dry + mh else np.nan
             if np.isfinite(zf):
                 Tf, Pf, _ = atmosphere(zf)
@@ -679,17 +718,17 @@ def main():
     show_grid([f1, f2, f3])
 
     # ------------------------------------------------------- 7. notes
-    st.header("7 · Model notes")
+    st.header("8 · Model notes")
     st.markdown(r"""
 **Envelope.** $V_{max}=\pi D^3/6$, $A=\pi D^2$, $m_{env}=A\,\rho_{fabric}$.
 
-**Helium rule - original model (default).** The target is where the launch helium exactly fills
-the envelope: $m_{He}=P(z_t)V_{max}M_{He}/(RT(z_t))$. The balloon still has free lift there and rises at
-constant volume to its real float, $\rho_{air}(z_f)V_{max}=m_{env}+m_{payload}+m_{He}$, with
-superpressure $\Delta P=m_{He}RT(z_f)/(V_{max}M_{He})-P(z_f)$.
-
-**Helium rule - float exactly at target.** $m_{He}=\rho_{air}(z_t)V_{max}-m_{env}-m_{payload}$; any
-helium above the fill amount acts as ballast and becomes superpressure.
+**Helium (original model).** Base helium exactly fills the envelope at the target:
+$m_{He,base}=P(z_t)V_{max}M_{He}/(RT(z_t))$. Launch helium, all loaded on the ground:
+$m_{He}=m_{He,base}(1+k)$, $k$ = lift margin. The balloon becomes taut at $z_{full}$ ($=z_t$ for $k=0$,
+lower for $k>0$) and rises at constant volume to its real float,
+$\rho_{air}(z_f)V_{max}=m_{env}+m_{payload}+m_{He}$, with superpressure
+$\Delta P=m_{He}RT(z_f)/(V_{max}M_{He})-P(z_f)$. More margin → more free lift and faster ascent,
+lower float and higher superpressure.
 
 **Compressible helium.** $m_{He}$ is constant; $V_{He}(z)=m_{He}RT/(PM_{He})$, launch volume
 $V_0=V_{He}(0)<V_{max}$. Lift-off requires $m_{He}M_{air}/M_{He}>m_{total}$. The highest reachable
