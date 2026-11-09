@@ -396,8 +396,8 @@ def sidebar():
 
     sb.subheader("2 · Mission")
     z_t = sb.number_input("Target altitude [km]", 1.0, 45.0, 14.0, 0.1) * 1000.0
-    payload = sb.number_input("Payload / hardware additions [kg]", 0.0, 10000.0, 10.5, 0.1)
-    margin = sb.number_input("Extra helium - lift margin [%]", 0.0, 200.0, 0.0, 1.0,
+    payload = sb.number_input("Payload / hardware additions [kg]", 0.0, 10000.0, 13.0, 0.1)
+    margin = sb.number_input("Extra helium - lift margin [%]", 0.0, 200.0, 20.0, 1.0,
                              help="0 % = helium that exactly fills V_max at the target "
                                   "(original model). Extra % is added on the ground: more free "
                                   "lift and faster ascent, the envelope fills lower, the balloon "
@@ -458,7 +458,7 @@ def show_grid(figs):
 
 def main():
     st.set_page_config(page_title="SPB Simulator", page_icon="🎈", layout="wide",
-                       initial_sidebar_state="expanded")
+                       initial_sidebar_state="auto")
     env, z_t, margin, lim, var, asc, th = sidebar()
     st.title("Super Pressure Balloon Simulator")
     st.caption("D → V_max, m_env  •  helium = fill V_max at target × (1 + lift margin), all loaded "
