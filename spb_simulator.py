@@ -1,30 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-Super Pressure Balloon (SPB) Simulator  -  fixed-envelope, mass-driven helium
-============================================================================
+Super Pressure Balloon (SPB) Simulator  -  target-altitude-driven design
+=======================================================================
 
 Design chain (recomputed on every input change):
-    1. Envelope geometry is fixed by the diameter D:
-           V_max = (pi/6) D^3        A = pi D^2           (sphere)
-    2. Envelope mass from area and film areal density:
-           m_env = A * (1 + seam overhead) * film_density
-    3. Dry mass:   m_dry = m_env + m_payload + m_hardware
-    4. BASE helium = helium needed for NEUTRAL BUOYANCY at the TARGET float
-       altitude (same balance as the original simulator):
-           rho_air(h_t) * V_He(h_t) = m_dry + m_He,base
-       where V_He(h_t) is the volume the helium occupies at ambient T, P.
-    5. Helium filling rule (separate control) adds a launch lift margin:
-           m_He,launch = m_He,base * (1 + margin)
-    6. Total system mass is always derived:
-           m_total = m_env + m_payload + m_hardware + m_He,launch
-    7. The fixed envelope then decides where the balloon really floats:
-           rho_air(h_float) * V_max = m_total    (fully pressurized)
-       The app compares h_float with the target and reports the envelope
-       diameter that would make them coincide.
+    1. Fixed envelope:   V_max = (pi/6) D^3,   A = pi D^2          (sphere)
+    2. Envelope mass:    m_env = A (1 + seam overhead) * film_density
+    3. Dry mass:         m_dry = m_env + m_extra   (payload + all hardware)
+    4. TARGET ALTITUDE drives the helium. A fully pressurized SPB floats where
+           rho_air(h_t) * V_max = m_total           (Archimedes, fixed volume)
+       so the required helium is
+           m_He = rho_air(h_t) * V_max - m_dry
+       and the total system mass m_total = m_dry + m_He.
+    5. Feasibility at the target:
+           * helium must at least fill V_max at h_t  ->  m_He >= m_fill
+             (equivalent to m_dry <= rho V (1 - M_He/M_air) = max dry mass)
+           * night: helium must stay pressurized (dP_min > 0), else slack/descent
+           * day:   film line load N = dP r / 2 must stay below allowable / SF
+           * launch free lift and ascent rate must be within operational limits
+           * the ascent simulation must reach the target within the sim time
 
 Physics modules: ISA 1976 atmosphere, 1-DOF ascent ODE (buoyancy, weight,
 quadratic drag, added mass, volume capped at V_max), 2-node transient thermal
-model (film + helium) for the 24 h cycle, superpressure and film line load.
+model (film + helium) for the 24 h cycle at float.
 
 Single file, no local dependencies -> deployable on Streamlit Community Cloud.
 """
@@ -104,22 +102,15 @@ def altitude_for_density(rho_target):
     return brentq(f, 0.0, 50000.0, xtol=0.1)
 
 
-def helium_volume(m_he, h, T_gas=None):
-    """Volume [m^3] of m_he kg of helium at ambient pressure of altitude h."""
-    T, P, _ = atmosphere(h)
-    return m_he * R_U * (T if T_gas is None else T_gas) / (P * M_HE)
-
-
 # =============================================================================
-# Design & mass budget
+# Design, helium sizing and feasibility envelope
 # =============================================================================
 @dataclass(frozen=True)
 class Design:
     diameter: float          # envelope diameter [m]
     film_gsm: float          # film areal density [g/m^2]
-    seam_pct: float          # seams / tapes / overlap overhead [% of area]
-    payload: float           # payload mass [kg]
-    hardware: float          # safety / hardware mass [kg]
+    seam_pct: float          # seams / tapes overhead [% of area]
+    extra: float             # payload + all hardware / additions [kg]
 
     @property
     def radius(self):
@@ -139,56 +130,49 @@ class Design:
 
     @property
     def m_dry(self):
-        return self.m_env + self.payload + self.hardware
+        return self.m_env + self.extra
 
 
-def base_helium(d: Design, h_target):
-    """Helium mass for neutral buoyancy at the target altitude (original logic):
-    displaced air mass of the helium volume = total system mass."""
-    T, P, rho = atmosphere(h_target)
+def target_sizing(d: Design, h_t):
+    """Helium and mass budget that make the fixed envelope float at h_t."""
+    T, P, rho = atmosphere(h_t)
+    m_total = rho * d.v_max                       # buoyancy capacity at target
+    m_he = m_total - d.m_dry                      # required helium
+    m_fill = rho * d.v_max * K_MOLAR              # helium that just fills V_max at h_t
+    m_dry_max = m_total - m_fill                  # = rho V (1 - K)
+    return dict(T=T, P=P, rho=rho, m_total=m_total, m_he=m_he, m_fill=m_fill,
+                m_dry_max=m_dry_max, extra_max=m_dry_max - d.m_env,
+                dp_iso=P * (m_he / m_fill - 1.0) if m_he > 0 else np.nan)
 
-    def neutral_balance(m_he):
-        V = helium_volume(m_he, h_target)
-        return V * rho - (d.m_env + d.payload + d.hardware + m_he)
 
-    hi = 10.0 * d.m_dry + 1.0
-    return brentq(neutral_balance, 1e-9, hi, xtol=1e-10)
-
-
-def launch_helium(m_he_base, rule, value, d: Design):
-    """Helium filling rule -> launch helium mass."""
-    if rule == "Lift margin on base helium":
-        return m_he_base * (1.0 + value / 100.0)
-    # "Free lift [% of total weight]": m_He/K = (1+f)(m_dry + m_He)
-    f = value / 100.0
-    return (1.0 + f) * d.m_dry / (1.0 / K_MOLAR - (1.0 + f))
+def helium_limits(d: Design, h_t, T_he_min, T_he_max, n_allow):
+    """Helium window at h_t from the thermal extremes (constant-volume gas):
+    night: P_in(T_min) >= P_amb         -> m_He >= m_lo
+    day:   (P_in(T_max) - P_amb) r/2 <= N_allow  -> m_He <= m_hi"""
+    T, P, rho = atmosphere(h_t)
+    m_lo = P * d.v_max * M_HE / (R_U * T_he_min)
+    dp_allow = 2.0 * n_allow / d.radius
+    m_hi = (P + dp_allow) * d.v_max * M_HE / (R_U * T_he_max)
+    return m_lo, m_hi
 
 
 def float_state(d: Design, m_he):
-    """Equilibrium float of the fixed envelope (helium at ambient temperature)."""
+    """Where a given envelope + helium really floats (helium at ambient T)."""
     m_total = d.m_dry + m_he
     h = altitude_for_density(m_total / d.v_max)
     if np.isnan(h):
         return dict(h=np.nan, T=np.nan, P=np.nan, dp=np.nan)
     T, P, rho = atmosphere(h)
-    m_fill = rho * d.v_max * K_MOLAR          # helium that just fills V_max
-    return dict(h=h, T=T, P=P, dp=P * (m_he / m_fill - 1.0))
+    return dict(h=h, T=T, P=P, dp=P * (m_he / (rho * d.v_max * K_MOLAR) - 1.0))
 
 
-def required_diameter(d: Design, h_target, rule, value):
-    """Envelope diameter whose float altitude equals the target (same masses,
-    same film, same filling rule). NaN if none in 0.2-200 m."""
-    def resid(D):
-        dx = replace(d, diameter=D)
-        mh = launch_helium(base_helium(dx, h_target), rule, value, dx)
-        return atmosphere(h_target)[2] * dx.v_max - (dx.m_dry + mh)
-    Ds = np.geomspace(0.2, 200.0, 200)
-    r = np.array([resid(D) for D in Ds])
-    idx = np.where(np.sign(r[:-1]) != np.sign(r[1:]))[0]
-    if len(idx) == 0:
-        return np.nan
-    i = idx[-1]
-    return brentq(resid, Ds[i], Ds[i + 1], xtol=1e-4)
+def min_diameter(d: Design, h_t):
+    """Smallest envelope that can carry m_extra to h_t (zero superpressure)."""
+    f = lambda D: target_sizing(replace(d, diameter=D), h_t)["extra_max"] - d.extra
+    Ds = np.geomspace(0.2, 300.0, 300)
+    r = np.array([f(D) for D in Ds])
+    idx = np.where((r[:-1] < 0) & (r[1:] >= 0))[0]
+    return brentq(f, Ds[idx[0]], Ds[idx[0] + 1], xtol=1e-4) if len(idx) else np.nan
 
 
 # =============================================================================
@@ -225,15 +209,15 @@ def run_ascent(m_he, m_sys, v_max, cd, c_add, t_end_s):
 class ThermalEnv:
     latitude_deg: float
     day_of_year: int
-    alpha: float          # film solar absorptivity
-    eps: float            # film IR emissivity
+    alpha: float
+    eps: float
     albedo: float
-    tau_atm: float        # transmissivity per unit air mass above the balloon
-    q_earth_ir: float     # upwelling Earth / cloud IR [W/m^2]
-    t_sky: float          # effective sky temperature [K]
-    h_ext: float          # external convection [W/m^2K]
-    h_int: float          # internal convection [W/m^2K]
-    cp_film: float        # film specific heat [J/kgK]
+    tau_atm: float
+    q_earth_ir: float
+    t_sky: float
+    h_ext: float
+    h_int: float
+    cp_film: float
 
 
 def direct_solar(hour, env: ThermalEnv, p_amb):
@@ -245,7 +229,7 @@ def direct_solar(hour, env: ThermalEnv, p_amb):
     if el <= 0.0:
         return 0.0, 0.0
     airmass = 1.0 / (np.sin(el) + 0.50572 * (np.degrees(el) + 6.07995) ** -1.6364)
-    airmass *= p_amb / P_SL          # only the air column above the balloon
+    airmass *= p_amb / P_SL
     return SOLAR_C * env.tau_atm ** airmass, np.sin(el)
 
 
@@ -263,7 +247,6 @@ def thermal_rhs(t, y, m_he, m_env, A, T_amb, p_amb, env):
 
 @st.cache_data(show_spinner=False)
 def run_thermal(m_he, m_env, A, T_amb, p_amb, env: ThermalEnv, n_days=3):
-    """Integrate n_days from ambient start; return the last (periodic) day."""
     t_end = n_days * 86400.0
     t_eval = np.linspace(t_end - 86400.0, t_end, 289)
     sol = solve_ivp(thermal_rhs, (0.0, t_end), [T_amb, T_amb],
@@ -275,20 +258,19 @@ def run_thermal(m_he, m_env, A, T_amb, p_amb, env: ThermalEnv, n_days=3):
 # =============================================================================
 # Case evaluation
 # =============================================================================
-def evaluate_case(label, d: Design, m_he, h_target, env, cd, c_add, t_asc_h):
+def evaluate_case(label, d: Design, m_he, env, cd, c_add, t_asc_h):
     m_sys = d.m_dry + m_he
-    gross = m_he / K_MOLAR                      # buoyancy mass at launch (isothermal)
+    gross = m_he / K_MOLAR
     fs = float_state(d, m_he)
     out = dict(label=label, design=d, m_he=m_he, m_sys=m_sys,
                fl_pct=(gross / m_sys - 1.0) * 100.0, fl_N=(gross - m_sys) * G0,
-               V0=helium_volume(m_he, 0.0), V_tgt=helium_volume(m_he, h_target),
                float=fs, ok=True, msg="")
-    if out["fl_pct"] <= 0:
-        out.update(ok=False, msg="No positive free lift at launch - the balloon will not ascend.")
+    if m_he <= 0 or out["fl_pct"] <= 0:
+        out.update(ok=False, msg="No positive free lift at launch - balloon cannot ascend.")
         return out
     out["ascent"] = run_ascent(m_he, m_sys, d.v_max, cd, c_add, t_asc_h * 3600.0)
     if np.isnan(fs["h"]):
-        out.update(ok=False, msg="No float equilibrium found below 50 km.")
+        out.update(ok=False, msg="No float equilibrium below 50 km.")
         return out
     hrs, T_he, T_f = run_thermal(m_he, d.m_env, d.area, fs["T"], fs["P"], env)
     dp = m_he * R_U * T_he / (d.v_max * M_HE) - fs["P"]
@@ -297,64 +279,70 @@ def evaluate_case(label, d: Design, m_he, h_target, env, cd, c_add, t_asc_h):
     return out
 
 
-def summary_row(c, h_target):
+def ascent_metrics(c, h_ref):
+    """Time to reach 98 % of h_ref, mean / max ascent rate, full-inflation altitude."""
+    if "ascent" not in c:
+        return dict(t_reach=np.nan, v_mean=np.nan, v_max=np.nan, h_full=np.nan, h_end=np.nan)
+    t, h, v, _, fill = c["ascent"]
+    reach = np.where(h >= 0.98 * h_ref)[0]
+    mask = (h > 100) & (h < 0.95 * h_ref) & (v > 0)
+    full = np.where(fill >= 99.9)[0]
+    return dict(t_reach=t[reach[0]] / 60.0 if len(reach) else np.nan,
+                v_mean=v[mask].mean() if mask.any() else np.nan,
+                v_max=v.max(), h_full=h[full[0]] if len(full) else np.nan, h_end=h[-1])
+
+
+def summary_row(c, h_t):
     d, fs = c["design"], c["float"]
+    am = ascent_metrics(c, fs["h"] if np.isfinite(fs["h"]) else h_t)
     row = {
         "Case": c["label"], "D [m]": d.diameter, "V_max [m³]": d.v_max,
         "m_env [kg]": d.m_env, "m_He [kg]": c["m_he"], "m_total [kg]": c["m_sys"],
-        "Free lift [%]": c["fl_pct"], "Free lift [N]": c["fl_N"],
-        "V_launch [m³]": c["V0"], "He fill @ target [%]": c["V_tgt"] / d.v_max * 100.0,
-        "Float alt [km]": fs["h"] / 1000.0,
-        "Float − target [km]": (fs["h"] - h_target) / 1000.0,
+        "Free lift [%]": c["fl_pct"], "Float alt [km]": fs["h"] / 1000.0,
+        "Float − target [km]": (fs["h"] - h_t) / 1000.0,
+        "Time to float [min]": am["t_reach"], "Mean ascent [m/s]": am["v_mean"],
         "ΔP isothermal [Pa]": fs["dp"],
     }
-    if "ascent" in c:
-        t, h, v, *_ = c["ascent"]
-        h_f = fs["h"] if np.isfinite(fs["h"]) else h[-1]
-        reach = np.where(h >= 0.98 * h_f)[0]
-        row["Time to float [min]"] = t[reach[0]] / 60.0 if len(reach) else np.nan
-        mask = (h > 100) & (h < 0.95 * h_f) & (v > 0)
-        row["Mean ascent rate [m/s]"] = v[mask].mean() if mask.any() else np.nan
     if "thermal" in c:
         th = c["thermal"]
-        row.update({
-            "ΔP min [Pa]": th["dp"].min(), "ΔP max [Pa]": th["dp"].max(),
-            "T_He min [K]": th["T_he"].min(), "T_He max [K]": th["T_he"].max(),
-            "Max film load [N/m]": th["load"].max(),
-        })
+        row.update({"ΔP min [Pa]": th["dp"].min(), "ΔP max [Pa]": th["dp"].max(),
+                    "T_He min [K]": th["T_he"].min(), "T_He max [K]": th["T_he"].max(),
+                    "Max film load [N/m]": th["load"].max()})
     return row
 
 
 # =============================================================================
-# Streamlit UI  (single page, no tabs)
+# Streamlit UI  (single page)
 # =============================================================================
 COLORS = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#a16207"]
+PASS, WARN, FAIL = "✅ Pass", "⚠️ Warning", "❌ Fail"
 
 
 def sidebar_inputs():
     sb = st.sidebar
     sb.title("🎈 SPB Inputs")
 
-    sb.subheader("1 · Envelope geometry")
+    sb.subheader("1 · Target float altitude")
+    h_t = sb.number_input("Target float altitude [km]", 1.0, 45.0, 14.0, 0.1,
+                          help="Drives the required helium mass and all feasibility checks.") * 1000.0
+
+    sb.subheader("2 · Envelope")
     D = sb.number_input("Envelope diameter D [m]", 0.5, 100.0, 4.6, 0.05,
                         help="Fixed design diameter. V_max = πD³/6, A = πD².")
     gsm = sb.number_input("Film areal density [g/m²]", 5.0, 300.0, 69.0, 1.0)
     seam = sb.number_input("Seam / tape overhead [% of area]", 0.0, 50.0, 0.0, 0.5)
 
-    sb.subheader("2 · Masses")
-    payload = sb.number_input("Payload mass [kg]", 0.0, 500.0, 0.0, 0.1)
-    hardware = sb.number_input("Safety / hardware mass [kg]", 0.0, 200.0, 5.0, 0.1)
+    sb.subheader("3 · Mass additions")
+    extra = sb.number_input("Payload + hardware additions [kg]", 0.0, 1000.0, 5.0, 0.1,
+                            help="Everything carried besides the envelope and helium: payload, "
+                                 "valves, rigging, cutter, parachute, ballast…")
 
-    sb.subheader("3 · Target float altitude")
-    h_t = sb.number_input("Target float altitude [km]", 1.0, 45.0, 14.0, 0.1,
-                          help="Altitude used for the neutral-buoyancy helium calculation.") * 1000.0
-
-    sb.subheader("4 · Helium filling rule")
-    rule = sb.radio("Launch helium =", ["Lift margin on base helium",
-                                        "Free lift [% of total weight]"], index=0,
-                    help="Base helium = neutral buoyancy at the target altitude. "
-                         "The rule adds lift so the balloon leaves the ground.")
-    rule_val = sb.number_input("Margin / free lift [%]", 0.0, 200.0, 20.0, 0.5)
+    sb.subheader("4 · Structural & flight limits")
+    n_allow = sb.number_input("Film allowable line load [N/m]", 100.0, 100000.0, 8000.0, 100.0,
+                              help="Envelope seam/film strength per unit width (burst limit).")
+    sf = sb.number_input("Structural safety factor", 1.0, 5.0, 1.5, 0.05)
+    fl_min = sb.number_input("Min launch free lift [%]", 0.0, 100.0, 10.0, 1.0)
+    v_lo, v_hi = sb.slider("Acceptable mean ascent rate [m/s]", 0.5, 15.0, (2.0, 7.0), 0.1)
 
     sb.subheader("5 · Sensitivity cases")
     he_var = sb.number_input("± helium mass [%]", 0.0, 50.0, 5.0, 0.5)
@@ -369,7 +357,7 @@ def sidebar_inputs():
     sb.subheader("7 · Thermal & radiation")
     lat = sb.number_input("Latitude [°]", -90.0, 90.0, 32.0, 0.1)
     doy = sb.slider("Day of year", 1, 365, 355, help="355 ≈ Dec 21.")
-    alpha = sb.slider("Film solar absorptivity α", 0.01, 1.0, 0.40, 0.01)
+    alpha = sb.slider("Film solar absorptivity α", 0.01, 1.0, 0.15, 0.01)
     eps = sb.slider("Film IR emissivity ε", 0.01, 1.0, 0.85, 0.01)
     albedo = sb.slider("Surface / cloud albedo", 0.0, 1.0, 0.30, 0.01)
     tau = sb.slider("Atmospheric transmissivity τ (per air mass)", 0.3, 1.0, 0.85, 0.01)
@@ -379,9 +367,10 @@ def sidebar_inputs():
     h_int = sb.slider("Internal convection h_int [W/m²K]", 0.1, 5.0, 2.0, 0.1)
     cp_f = sb.number_input("Film specific heat [J/kgK]", 500.0, 3000.0, 1500.0, 50.0)
 
-    design = Design(D, gsm, seam, payload, hardware)
+    design = Design(D, gsm, seam, extra)
     env = ThermalEnv(lat, int(doy), alpha, eps, albedo, tau, q_ir, t_sky, h_ext, h_int, cp_f)
-    return (design, h_t, rule, rule_val, env,
+    limits = dict(n_allow=n_allow, sf=sf, fl_min=fl_min, v_lo=v_lo, v_hi=v_hi)
+    return (design, h_t, limits, env,
             dict(he=he_var, d=d_var, gsm=gsm_var), dict(cd=cd, c_add=c_add, t_asc=t_asc))
 
 
@@ -405,96 +394,151 @@ def line_fig(title, xt, yt, hover="x unified"):
     return fig
 
 
+def feasibility_checks(d, h_t, sz, base, am, lim, m_lo, m_hi):
+    """Return list of (check, value, limit, status, comment)."""
+    rows = []
+    n_lim = lim["n_allow"] / lim["sf"]
+
+    # 1 - can it float at the target at all?
+    if sz["m_he"] <= 0:
+        rows.append(("Lift capacity at target", f"m_dry {d.m_dry:.2f} kg",
+                     f"≤ {sz['m_total']:.2f} kg", FAIL,
+                     "Dry mass exceeds the total buoyancy of V_max at the target."))
+        return rows
+    st_fill = PASS if sz["m_he"] >= sz["m_fill"] else FAIL
+    rows.append(("Envelope pressurized at target", f"{sz['m_he']:.3f} kg He",
+                 f"≥ {sz['m_fill']:.3f} kg (fill)", st_fill,
+                 "OK - helium fills V_max at the target." if st_fill == PASS else
+                 "Too heavy: helium cannot fill V_max - the balloon would not lift off / "
+                 "reach the target. Reduce mass or enlarge D."))
+    if st_fill == FAIL:
+        return rows
+
+    # 2 - launch & ascent
+    fl = base["fl_pct"]
+    rows.append(("Launch free lift", f"{fl:.1f} %", f"≥ {lim['fl_min']:.0f} %",
+                 PASS if fl >= lim["fl_min"] else WARN,
+                 "OK" if fl >= lim["fl_min"] else "Low free lift: slow, wind-sensitive launch."))
+    vm = am["v_mean"]
+    if np.isfinite(vm):
+        s = PASS if lim["v_lo"] <= vm <= lim["v_hi"] else WARN
+        msg = ("OK" if s == PASS else
+               "Too slow - long cold tropopause crossing, large drift." if vm < lim["v_lo"] else
+               "Too fast - high dynamic load and overshoot at full inflation.")
+        rows.append(("Mean ascent rate", f"{vm:.2f} m/s",
+                     f"{lim['v_lo']:.1f}–{lim['v_hi']:.1f} m/s", s, msg))
+    reached = np.isfinite(am["t_reach"])
+    rows.append(("Reaches target in sim time", f"{am['h_end']/1000:.2f} km at end",
+                 f"≥ {0.98*h_t/1000:.2f} km", PASS if reached else FAIL,
+                 f"Reached in {am['t_reach']:.0f} min." if reached else
+                 "Did not reach the target - extend sim time or increase lift."))
+    if np.isfinite(am["h_full"]):
+        rows.append(("Full-inflation altitude", f"{am['h_full']/1000:.2f} km",
+                     f"< {h_t/1000:.2f} km", PASS,
+                     "Envelope becomes taut below the target, then floats on superpressure."))
+
+    # 3 - float: superpressure & structure
+    if "thermal" in base:
+        th = base["thermal"]
+        dpmin, nmax = th["dp"].min(), th["load"].max()
+        rows.append(("Night superpressure (ΔP min)", f"{dpmin:,.0f} Pa", "> 0 Pa",
+                     PASS if dpmin > 0 else FAIL,
+                     "Stays pressurized all night." if dpmin > 0 else
+                     f"Goes slack at night → altitude loss. Need ≥ {m_lo:.3f} kg He."))
+        rows.append(("Peak film load (day)", f"{nmax:,.0f} N/m", f"≤ {n_lim:,.0f} N/m (allow/SF)",
+                     PASS if nmax <= n_lim else (WARN if nmax <= lim["n_allow"] else FAIL),
+                     "OK" if nmax <= n_lim else
+                     ("Inside allowable but below the safety factor." if nmax <= lim["n_allow"]
+                      else f"Over-pressure / burst risk. Keep He ≤ {m_hi:.3f} kg.")))
+    return rows
+
+
 def main():
     st.set_page_config(page_title="SPB Simulator", page_icon="🎈", layout="wide",
                        initial_sidebar_state="expanded")
-    design, h_t, rule, rule_val, env, var, dyn = sidebar_inputs()
+    design, h_t, lim, env, var, dyn = sidebar_inputs()
 
     st.title("Super Pressure Balloon Simulator")
-    st.caption("Diameter → V_max & area → envelope mass → dry mass → helium for neutral buoyancy "
-               "at the target altitude → + filling rule → total system mass → actual float of the "
-               "fixed envelope.")
+    st.caption("Target altitude + fixed envelope → buoyancy capacity ρ(h)·V_max → required helium "
+               "= capacity − dry mass → ascent, 24 h superpressure and structural checks.")
 
-    # ---- Mass budget (all derived) ----------------------------------------
-    m_he_base = base_helium(design, h_t)
-    m_he = launch_helium(m_he_base, rule, rule_val, design)
-    if not np.isfinite(m_he) or m_he <= 0:
-        st.error("The filling rule gives no valid helium mass. Reduce the free-lift value.")
-        st.stop()
-    m_total_base = design.m_dry + m_he_base
-    m_total = design.m_dry + m_he
-    T_t, P_t, rho_t = atmosphere(h_t)
-    V_base_t = helium_volume(m_he_base, h_t)
-    D_req = required_diameter(design, h_t, rule, rule_val)
+    sz = target_sizing(design, h_t)
+    m_he = sz["m_he"]
 
-    base = evaluate_case("Baseline", design, m_he, h_t, env, dyn["cd"], dyn["c_add"], dyn["t_asc"])
-    fs = base["float"]
-
-    st.header("Mass budget")
+    # ---- Mass budget --------------------------------------------------------
+    st.header("Mass budget for the target altitude")
     c = st.columns(6)
-    c[0].metric("V_max", f"{design.v_max:,.1f} m³")
-    c[1].metric("Envelope area", f"{design.area:,.1f} m²")
-    c[2].metric("Envelope mass", f"{design.m_env:,.2f} kg")
-    c[3].metric("Base helium (neutral @ target)", f"{m_he_base:,.3f} kg")
-    c[4].metric("Launch helium", f"{m_he:,.3f} kg", f"+{m_he - m_he_base:,.3f} kg (rule)",
+    c[0].metric("Target altitude", f"{h_t/1000:,.2f} km",
+                f"ρ = {sz['rho']:.4f} kg/m³", delta_color="off")
+    c[1].metric("V_max / area", f"{design.v_max:,.1f} m³", f"{design.area:,.1f} m²",
                 delta_color="off")
-    c[5].metric("Total system mass", f"{m_total:,.2f} kg",
-                f"{m_total_base:,.2f} kg at neutral", delta_color="off")
+    c[2].metric("Envelope mass", f"{design.m_env:,.2f} kg")
+    c[3].metric("Dry mass (env + additions)", f"{design.m_dry:,.2f} kg")
+    c[4].metric("Required helium", f"{m_he:,.3f} kg" if m_he > 0 else "—",
+                f"min to fill V_max: {sz['m_fill']:.3f} kg", delta_color="off")
+    c[5].metric("Total system mass", f"{design.m_dry + max(m_he, 0):,.2f} kg",
+                f"capacity ρ·V_max = {sz['m_total']:.2f} kg", delta_color="off")
+
+    if m_he <= 0 or m_he < sz["m_fill"]:
+        dmin = min_diameter(design, h_t)
+        st.error(f"❌ Not feasible: the {design.diameter:g} m envelope cannot carry "
+                 f"{design.extra:g} kg of additions to {h_t/1000:.1f} km. Maximum additions for this "
+                 f"envelope: {max(sz['extra_max'], 0):.2f} kg. Minimum diameter for this load: "
+                 f"{dmin:.2f} m.")
+        st.stop()
+
+    base = evaluate_case("Baseline", design, m_he, env, dyn["cd"], dyn["c_add"], dyn["t_asc"])
+    am = ascent_metrics(base, h_t)
+    th = base.get("thermal")
+    T_lo, T_hi = (th["T_he"].min(), th["T_he"].max()) if th else (sz["T"], sz["T"])
+    m_lo, m_hi = helium_limits(design, h_t, T_lo, T_hi, lim["n_allow"] / lim["sf"])
 
     budget = pd.DataFrame({
-        "Component": ["Envelope (film × area)", "Payload", "Safety / hardware",
-                      "Helium – base (neutral @ target)", "Helium – filling-rule margin",
-                      "TOTAL SYSTEM MASS"],
-        "Mass [kg]": [design.m_env, design.payload, design.hardware, m_he_base,
-                      m_he - m_he_base, m_total],
-    })
-    budget["Share [%]"] = budget["Mass [kg]"] / m_total * 100.0
-    a, b = st.columns([1, 1])
+        "Component": ["Envelope (film × area)", "Payload + hardware additions",
+                      "Helium (target-driven)", "TOTAL SYSTEM MASS"],
+        "Mass [kg]": [design.m_env, design.extra, m_he, design.m_dry + m_he]})
+    budget["Share [%]"] = budget["Mass [kg]"] / budget["Mass [kg]"].iloc[-1] * 100.0
+    a, b = st.columns(2)
     a.dataframe(budget.style.format({"Mass [kg]": "{:,.3f}", "Share [%]": "{:,.1f}"}),
                 hide_index=True, width="stretch")
     pie = go.Figure(go.Pie(labels=budget["Component"][:-1], values=budget["Mass [kg]"][:-1],
                            hole=0.5, sort=False, marker=dict(colors=COLORS)))
-    pie.update_layout(height=280, margin=dict(l=0, r=0, t=10, b=10))
+    pie.update_layout(height=260, margin=dict(l=0, r=0, t=10, b=10))
     b.plotly_chart(pie, width="stretch")
 
-    # ---- Target altitude vs envelope ---------------------------------------
-    st.header("Target altitude check")
-    c = st.columns(5)
-    c[0].metric("Target altitude", f"{h_t / 1000:,.2f} km")
-    c[1].metric("Base He volume @ target", f"{V_base_t:,.1f} m³",
-                f"{V_base_t / design.v_max * 100:,.1f}% of V_max", delta_color="off")
-    c[2].metric("Actual float altitude",
-                f"{fs['h'] / 1000:,.2f} km" if np.isfinite(fs["h"]) else "—",
-                f"{(fs['h'] - h_t) / 1000:+,.2f} km vs target" if np.isfinite(fs["h"]) else None,
-                delta_color="off")
-    c[3].metric("Launch free lift", f"{base['fl_pct']:,.1f} %", f"{base['fl_N']:,.1f} N",
-                delta_color="off")
-    c[4].metric("Diameter to float at target",
-                f"{D_req:,.2f} m" if np.isfinite(D_req) else "—",
-                f"{D_req - design.diameter:+,.2f} m vs current" if np.isfinite(D_req) else None,
-                delta_color="off")
-
-    if V_base_t > design.v_max:
-        st.error(f"The envelope is too small: at {h_t/1000:.1f} km the base helium needs "
-                 f"{V_base_t:,.1f} m³ but V_max is {design.v_max:,.1f} m³. The balloon becomes "
-                 f"pressurized and stops below the target. Increase D to ≈ {D_req:,.2f} m, "
-                 "reduce mass, or lower the target.")
-    elif np.isfinite(fs["h"]) and abs(fs["h"] - h_t) > 250:
-        st.info(f"With D = {design.diameter:g} m the balloon floats at {fs['h']/1000:.2f} km, "
-                f"{'above' if fs['h'] > h_t else 'below'} the {h_t/1000:.1f} km target. "
-                f"A {D_req:,.2f} m envelope would float exactly at the target with these masses "
-                "and this filling rule.")
+    # ---- Feasibility --------------------------------------------------------
+    st.header("Flight feasibility")
+    checks = feasibility_checks(design, h_t, sz, base, am, lim, m_lo, m_hi)
+    n_fail = sum(r[3] == FAIL for r in checks)
+    n_warn = sum(r[3] == WARN for r in checks)
+    if n_fail:
+        st.error(f"❌ Design NOT feasible - {n_fail} failed check(s), {n_warn} warning(s).")
+    elif n_warn:
+        st.warning(f"⚠️ Feasible with {n_warn} warning(s).")
     else:
-        st.success("The envelope floats at the target altitude with these masses.")
-    if not base["ok"]:
-        st.error(base["msg"])
+        st.success("✅ Design feasible: reaches the target, stays pressurized and within structural limits.")
+    st.dataframe(pd.DataFrame(checks, columns=["Check", "Value", "Limit", "Status", "Comment"]),
+                 hide_index=True, width="stretch")
 
-    # ---- Run cases ----------------------------------------------------------
+    ex_lo = sz["m_total"] - design.m_env - m_hi     # lightest additions (burst limit)
+    ex_hi = sz["m_total"] - design.m_env - m_lo     # heaviest additions (night slack)
+    c = st.columns(4)
+    c[0].metric("Helium window @ target", f"{m_lo:.3f} – {m_hi:.3f} kg",
+                f"current {m_he:.3f} kg", delta_color="off",
+                help="Night pressurization (min) to structural limit (max), using the baseline "
+                     "helium temperature extremes.")
+    c[1].metric("Additions window @ target", f"{max(ex_lo, 0):.2f} – {ex_hi:.2f} kg"
+                if ex_hi > max(ex_lo, 0) else "none",
+                f"current {design.extra:.2f} kg", delta_color="off")
+    c[2].metric("Isothermal ΔP @ target", f"{sz['dp_iso']:,.0f} Pa")
+    c[3].metric("Min diameter (zero ΔP)", f"{min_diameter(design, h_t):.2f} m",
+                f"current {design.diameter:g} m", delta_color="off")
+
+    # ---- Cases --------------------------------------------------------------
     cases = build_cases(design, m_he, var)
     with st.spinner("Running ascent and 24 h thermal simulations…"):
-        results = [base] + [evaluate_case(lbl, d, mh, h_t, env, dyn["cd"], dyn["c_add"],
-                                          dyn["t_asc"]) for lbl, d, mh in cases[1:]]
-
+        results = [base] + [evaluate_case(lbl, d, mh, env, dyn["cd"], dyn["c_add"], dyn["t_asc"])
+                            for lbl, d, mh in cases[1:]]
     st.header("Simulation summary")
     df = pd.DataFrame([summary_row(r, h_t) for r in results]).set_index("Case")
     st.dataframe(df.style.format("{:,.2f}", na_rep="—"), width="stretch")
@@ -520,6 +564,7 @@ def main():
         f_fill.add_trace(go.Scatter(x=h / 1000, y=fill, **kw))
     f_h.add_hline(y=h_t / 1000, line_dash="dash", line_color="gray",
                   annotation_text="target", annotation_position="bottom right")
+    f_v.add_hrect(y0=lim["v_lo"], y1=lim["v_hi"], fillcolor="green", opacity=0.07, line_width=0)
     f_fill.add_vline(x=h_t / 1000, line_dash="dash", line_color="gray")
     a, b = st.columns(2)
     a.plotly_chart(f_h, width="stretch"); b.plotly_chart(f_v, width="stretch")
@@ -527,8 +572,9 @@ def main():
 
     # ---- Thermal ------------------------------------------------------------
     st.header("24-hour thermal cycle at float")
-    st.caption("Third day of a 3-day integration (periodic state), local solar time; "
-               "altitude and volume held at the actual float point.")
+    st.caption("Third day of a 3-day integration, local solar time; altitude and volume held "
+               "at each case's float point.")
+    n_lim = lim["n_allow"] / lim["sf"]
     f_T = line_fig("Helium temperature", "Hour of day", "T_He [K]")
     f_Tf = line_fig("Film temperature", "Hour of day", "T_film [K]")
     f_dp = line_fig("Superpressure ΔP = P_in − P_amb", "Hour of day", "ΔP [Pa]")
@@ -536,47 +582,55 @@ def main():
     for r, col in zip(results, COLORS * 2):
         if "thermal" not in r:
             continue
-        th = r["thermal"]
+        t_ = r["thermal"]
         kw = dict(name=r["label"], line=dict(color=col))
-        f_T.add_trace(go.Scatter(x=th["hours"], y=th["T_he"], **kw))
-        f_Tf.add_trace(go.Scatter(x=th["hours"], y=th["T_f"], **kw))
-        f_dp.add_trace(go.Scatter(x=th["hours"], y=th["dp"], **kw))
-        f_N.add_trace(go.Scatter(x=th["hours"], y=th["load"], **kw))
-    f_dp.add_hline(y=0, line_dash="dot", line_color="gray")
+        f_T.add_trace(go.Scatter(x=t_["hours"], y=t_["T_he"], **kw))
+        f_Tf.add_trace(go.Scatter(x=t_["hours"], y=t_["T_f"], **kw))
+        f_dp.add_trace(go.Scatter(x=t_["hours"], y=t_["dp"], **kw))
+        f_N.add_trace(go.Scatter(x=t_["hours"], y=t_["load"], **kw))
+    f_dp.add_hline(y=0, line_dash="dot", line_color="gray", annotation_text="slack")
+    f_N.add_hline(y=n_lim, line_dash="dash", line_color=COLORS[1], annotation_text="allow / SF")
+    f_N.add_hline(y=lim["n_allow"], line_dash="dot", line_color=COLORS[1],
+                  annotation_text="allowable")
     for f in (f_T, f_Tf, f_dp, f_N):
         f.update_xaxes(dtick=3, range=[0, 24])
     a, b = st.columns(2)
     a.plotly_chart(f_T, width="stretch"); b.plotly_chart(f_Tf, width="stretch")
     a.plotly_chart(f_dp, width="stretch"); b.plotly_chart(f_N, width="stretch")
-    if "thermal" in base and base["thermal"]["dp"].min() < 0:
-        st.warning("Baseline loses superpressure (ΔP < 0) during part of the cycle - "
-                   "the balloon goes slack and descends at night.")
 
-    # ---- Design map ---------------------------------------------------------
-    st.header("Design map: effect of envelope diameter")
-    st.caption("Same film, payload, hardware, target and filling rule; helium recomputed for "
-               "each diameter. Dashed = current D, dotted = diameter that floats at the target.")
-    Ds = np.linspace(max(0.5, design.diameter * 0.5), design.diameter * 2.0, 120)
-    rows = []
+    # ---- Design space -------------------------------------------------------
+    st.header("Design space for the target altitude")
+    st.caption("Approximate: uses the baseline helium temperature extremes. Green band = feasible.")
+    # (a) vs additions mass, fixed D
+    exs = np.linspace(0.0, max(sz["extra_max"] * 1.15, design.extra * 1.5, 1.0), 150)
+    he_req = sz["m_total"] - design.m_env - exs
+    f1 = line_fig(f"Helium required vs additions (D = {design.diameter:g} m)",
+                  "Payload + hardware additions [kg]", "Helium [kg]", "closest")
+    f1.add_trace(go.Scatter(x=exs, y=he_req, name="Required He", line=dict(color=COLORS[0])))
+    f1.add_hline(y=m_lo, line_dash="dot", line_color=COLORS[4], annotation_text="night slack limit")
+    f1.add_hline(y=m_hi, line_dash="dot", line_color=COLORS[1], annotation_text="structural limit")
+    if ex_hi > max(ex_lo, 0):
+        f1.add_vrect(x0=max(ex_lo, 0), x1=ex_hi, fillcolor="green", opacity=0.08, line_width=0)
+    f1.add_vline(x=design.extra, line_dash="dash", line_color="gray")
+    # (b) additions window vs diameter
+    Ds = np.linspace(max(0.5, design.diameter * 0.6), design.diameter * 1.8, 120)
+    lo_l, hi_l = [], []
     for Dx in Ds:
         dx = replace(design, diameter=Dx)
-        mb = base_helium(dx, h_t)
-        ml = launch_helium(mb, rule, rule_val, dx)
-        fx = float_state(dx, ml)
-        rows.append(dict(D=Dx, m_env=dx.m_env, m_he=ml, m_tot=dx.m_dry + ml,
-                         h=fx["h"] / 1000, dp=fx["dp"]))
-    mp = pd.DataFrame(rows)
-    f1 = line_fig("Float altitude vs diameter", "Diameter [m]", "Float altitude [km]")
-    f1.add_trace(go.Scatter(x=mp.D, y=mp.h, name="Float altitude", line=dict(color=COLORS[0])))
-    f1.add_hline(y=h_t / 1000, line_dash="dash", line_color=COLORS[1], annotation_text="target")
-    f2 = line_fig("Masses vs diameter", "Diameter [m]", "Mass [kg]")
-    for key, name, col in (("m_env", "Envelope", 1), ("m_he", "Launch helium", 2),
-                           ("m_tot", "Total system", 3)):
-        f2.add_trace(go.Scatter(x=mp.D, y=mp[key], name=name, line=dict(color=COLORS[col])))
-    for f in (f1, f2):
-        f.add_vline(x=design.diameter, line_dash="dash", line_color="gray")
-        if np.isfinite(D_req):
-            f.add_vline(x=D_req, line_dash="dot", line_color=COLORS[1])
+        s2 = target_sizing(dx, h_t)
+        a_lo, a_hi = helium_limits(dx, h_t, T_lo, T_hi, lim["n_allow"] / lim["sf"])
+        lo_l.append(max(s2["m_total"] - dx.m_env - a_hi, 0.0))
+        hi_l.append(s2["m_total"] - dx.m_env - a_lo)
+    lo_l, hi_l = np.array(lo_l), np.array(hi_l)
+    ok = hi_l > lo_l
+    f2 = line_fig("Feasible additions vs envelope diameter", "Diameter [m]",
+                  "Payload + hardware additions [kg]", "closest")
+    f2.add_trace(go.Scatter(x=Ds[ok], y=hi_l[ok], name="Max (night slack)",
+                            line=dict(color=COLORS[4])))
+    f2.add_trace(go.Scatter(x=Ds[ok], y=lo_l[ok], name="Min (structural)", fill="tonexty",
+                            fillcolor="rgba(22,163,74,0.12)", line=dict(color=COLORS[1])))
+    f2.add_trace(go.Scatter(x=[design.diameter], y=[design.extra], name="Current design",
+                            mode="markers", marker=dict(size=12, color="black", symbol="x")))
     a, b = st.columns(2)
     a.plotly_chart(f1, width="stretch"); b.plotly_chart(f2, width="stretch")
 
@@ -584,22 +638,19 @@ def main():
     st.header("Model notes")
     st.markdown(r"""
 **Mass chain.** $V_{max}=\tfrac{\pi}{6}D^3$, $A=\pi D^2$, $m_{env}=A(1+s)\rho_{film}$,
-$m_{dry}=m_{env}+m_{payload}+m_{hw}$.
+$m_{dry}=m_{env}+m_{add}$.
 
-**Base helium (neutral buoyancy at target $h_t$, original logic).**
-$\rho_{air}(h_t)\,V_{He}(h_t)=m_{dry}+m_{He,base}$ with $V_{He}=m_{He}RT/(PM_{He})$
-$\Rightarrow m_{He,base}=m_{dry}\,\dfrac{M_{He}/M_{air}}{1-M_{He}/M_{air}}\approx0.16\,m_{dry}$.
-It scales with every mass component, so payload, hardware or film changes update the helium and
-$m_{total}$ automatically. Because helium and air expand together, this mass is the same
-for every target altitude. The target altitude decides whether the fixed envelope is big enough,
-via $V_{He}(h_t)\le V_{max}$.
+**Target-driven helium.** A pressurized SPB has fixed volume, so it floats where
+$\rho_{air}(h_t)V_{max}=m_{total}$. Hence $m_{He}=\rho_{air}(h_t)V_{max}-m_{dry}$ and
+$m_{total}=m_{dry}+m_{He}$. For a fixed envelope and target, the buoyancy capacity
+$\rho V_{max}$ is fixed: heavier additions mean less helium and lower superpressure, until the
+helium can no longer fill $V_{max}$ ($m_{He}<m_{fill}=\rho V_{max}M_{He}/M_{air}$), at which
+point the target is unreachable. Raising the target or the additions changes the helium; the
+total system mass follows the target altitude.
 
-**Filling rule.** Lift margin: $m_{He}=m_{He,base}(1+k)$. Free lift: $m_{He}/K=(1+f)(m_{dry}+m_{He})$.
-$m_{total}=m_{dry}+m_{He}$.
-
-**Actual float of the fixed envelope.** $\rho_{air}(h_f)\,V_{max}=m_{total}$; isothermal
-$\Delta P=P\,(m_{He}/m_{fill}-1)$, $m_{fill}=\rho_{air}V_{max}M_{He}/M_{air}$. The *diameter to float
-at target* solves $\rho_{air}(h_t)V_{max}(D)=m_{total}(D)$.
+**Superpressure.** Isothermal $\Delta P=P(m_{He}/m_{fill}-1)$; diurnal
+$\Delta P(t)=m_{He}RT_{He}(t)/(V_{max}M_{He})-P$. Film line load $N=\Delta P\,r/2$.
+Helium window: $m_{lo}=PV M_{He}/(RT_{He,min})$, $m_{hi}=(P+2N_{allow}/(SF\,r))VM_{He}/(RT_{He,max})$.
 
 **Ascent.** $(m+C_a\rho V)\ddot h=\rho Vg-mg-\tfrac12\rho\dot h|\dot h|C_dA_p$, $V=\min(V_{He},V_{max})$.
 
@@ -607,8 +658,8 @@ at target* solves $\rho_{air}(h_t)V_{max}(D)=m_{total}(D)$.
 +\tfrac{\varepsilon A}{2}(q_{IR,E}+\sigma T_{sky}^4)-\varepsilon\sigma AT_f^4-h_{ext}A(T_f-T_{amb})-h_{int}A(T_f-T_{He})$,
 $m_{He}c_v\dot T_{He}=h_{int}A(T_f-T_{He})$.
 
-**Limitations.** Spherical shape, no film creep, no helium leakage, altitude fixed during the
-thermal cycle, no slack-balloon descent when ΔP < 0, ISA atmosphere.
+**Limitations.** Spherical envelope, no film creep or elasticity, no helium leakage, altitude
+fixed during the thermal cycle, ISA atmosphere, no wind or tropopause cold-soak during ascent.
 """)
 
 
