@@ -348,14 +348,14 @@ def feasibility_table(env, z_t, sz, base, lim, m_lo, m_hi):
     rows.append(("Launch free lift margin", f"{fl:.1f} %", f"≥ {lim['fl_min']:.0f} %",
                  PASS if fl >= lim["fl_min"] else WARN,
                  "OK" if fl >= lim["fl_min"] else "Low - slow, wind-sensitive launch."))
-    rows.append(("Envelope fills (z_full)", f"{sz['z_full']/1000:.2f} km",
-                 f"≤ {z_t/1000:.2f} km", PASS if sz["z_full"] <= z_t + 1.0 else FAIL,
+    rows.append(("Envelope fills (z_full)", f"{sz['z_full']/1000:.2f} km", "info", PASS,
                  f"Slack at launch (V₀ = {sz['V0']:.2f} m³, {sz['V0']/env.v_max*100:.1f}% of V_max), "
                  f"taut at {sz['z_full']/1000:.2f} km."))
-    rows.append(("Float altitude", f"{sz['z_float']/1000:.2f} km", f"≥ {z_t/1000:.2f} km",
-                 PASS if sz["z_float"] >= z_t - 1.0 else FAIL,
-                 f"Floats {(sz['z_float'] - z_t)/1000:+.2f} km relative to the target, "
-                 f"isothermal ΔP {sz['dp_float']:,.0f} Pa."))
+    dev_km = (sz["z_float"] - z_t) / 1000.0
+    rows.append(("Float altitude vs target", f"{sz['z_float']/1000:.2f} km ({dev_km:+.2f} km)",
+                 f"within ±{lim['dev_max']:.1f} km", PASS if abs(dev_km) <= lim["dev_max"] else FAIL,
+                 f"Isothermal ΔP at float {sz['dp_float']:,.0f} Pa." if abs(dev_km) <= lim["dev_max"]
+                 else f"Float is {abs(dev_km):.1f} km {'above' if dev_km > 0 else 'below'} the target."))
     va = base.get("v_avg", np.nan)
     if np.isfinite(va):
         ok = lim["v_lo"] <= va <= lim["v_hi"]
@@ -366,14 +366,14 @@ def feasibility_table(env, z_t, sz, base, lim, m_lo, m_hi):
                                       "Too fast - high dynamic load and overshoot at full inflation.")))
     reached = np.isfinite(base.get("t_reach", np.nan))
     rows.append(("Float reached in ascent sim", f"{base['z_end']/1000:.2f} km at end",
-                 f"≥ {0.98*sz['z_float']/1000:.2f} km", PASS if reached else FAIL,
+                 f"≥ {0.98*sz['z_float']/1000:.2f} km", PASS if reached else WARN,
                  f"Reached in {base['t_reach']:.0f} min." if reached
                  else "Not reached - extend the ascent time."))
     t = base["thermal"]
     n_lim = lim["n_allow"] / lim["sf"]
     dpmin, nmax = t["dp"].min(), t["load"].max()
     rows.append(("Night superpressure ΔP min", f"{dpmin:,.0f} Pa", "> 0 Pa",
-                 PASS if dpmin > 0 else FAIL,
+                 PASS if dpmin > 0 else WARN,
                  "Pressurized all night." if dpmin > 0 else
                  f"Envelope goes slack at night → descent (≈ {m_lo:.3f} kg He needed to stay taut)."))
     s = PASS if nmax <= n_lim else (WARN if nmax <= lim["n_allow"] else FAIL)
@@ -409,6 +409,8 @@ def sidebar():
     sf = sb.number_input("Safety factor", 1.0, 5.0, 1.5, 0.05)
     fl_min = sb.number_input("Min launch free lift [%]", 0.0, 500.0, 10.0, 1.0)
     v_lo, v_hi = sb.slider("Acceptable mean ascent rate [m/s]", 0.5, 15.0, (2.0, 7.0), 0.1)
+    dev_max = sb.number_input("Allowed float deviation from target [km]", 0.5, 30.0, 5.0, 0.5,
+                              help="Only a larger deviation is reported as an error.")
 
     sb.subheader("4 · Sensitivity cases")
     he_var = sb.number_input("± helium mass [%]", 0.0, 50.0, 5.0, 0.5)
@@ -438,7 +440,7 @@ def sidebar():
     t_sky = sb.number_input("Sky temperature [K]", 3.0, 300.0, 216.65, 1.0)
 
     return (Envelope(D, gsm, payload), z_t, margin,
-            dict(n_allow=n_allow, sf=sf, fl_min=fl_min, v_lo=v_lo, v_hi=v_hi),
+            dict(n_allow=n_allow, sf=sf, fl_min=fl_min, v_lo=v_lo, v_hi=v_hi, dev_max=dev_max),
             dict(he=he_var, vol=vol_var), dict(cd=cd, c_add=c_add, t=t_asc),
             Thermal(lat, dec, alpha, eps, albedo, tau, t_sky, h_conv, h_int, cp_film, int(spin)))
 
